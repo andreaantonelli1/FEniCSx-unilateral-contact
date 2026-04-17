@@ -16,9 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
-        libgl1 \
-        libxext6 \
-        libxrender1 \
         python3-pip \
         wget \
     && echo "${USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \

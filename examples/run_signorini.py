@@ -67,7 +67,6 @@ class ConvergenceStatus(Enum):
     """Status codes for solve_step."""
     CONVERGED = 0
     MAX_ITERATIONS = 1
-    STAGNATED = 2
     SNES_FAILED = 3
     EXCEPTION = 4
 
@@ -115,7 +114,7 @@ class SimulationConfig:
     theta: int = 0
     gamma0: float = 10.0        # gamma = gamma0 * Y / h
     
-    # Augmented Lagrangian (with Uzawa) contact parameters
+    # Augmented Lagrangian (with and without Uzawa) contact parameters
     al_coeff: float = 1.0    # Adimensional coefficient for scaling
     uzawa_penalty: float = al_coeff * Y / LcMin
     aug_lag_penalty: float = al_coeff * Y 
@@ -338,7 +337,6 @@ class ContactProblem:
             # For linear elasticity, current normal == reference normal 
             self.nx = self.Nx
     
-
         # Normal traction (from 1st Piola-Kirchhoff stress)
         self.P_N = ufl.dot(self.P, self.Nx)
         # Normal component of traction (contact pressure)
@@ -441,7 +439,7 @@ class ContactProblem:
 # =============================================================================
 
 class ContactSolver:
-    """Newton solver for contact problem."""
+    """Solver class for contact problem."""
     
     def __init__(self, problem: ContactProblem, cfg: SimulationConfig):
         self.problem = problem
@@ -525,6 +523,7 @@ class ContactSolver:
     
     def _solve_standard(self, d_val, step):
         """Solve contact problem with alternating solution strategy
+            and Nitsche's method for contact enforcement.
         
         Alternating strategy:
         1. Solve for contact mapping (ray-tracing) with current displacement
@@ -589,7 +588,7 @@ class ContactSolver:
                 R=cfg.R,
                 step_idx=step,
                 output_dir=os.path.join(cfg.output_dir, "ray_tracing"),
-                debug_plots=cfg.debug_plots if alt_iter == 0  else False,  # Only debug first iteration
+                debug_plots=cfg.debug_plots,
                 debug_monitor=False,
                 u_field=self.u_sub
             )
@@ -597,10 +596,10 @@ class ContactSolver:
             # Update positions of projected points on reference plane
             y = ufl.as_vector([self.xi, cfg.plane_loc * np.ones_like(self.xi)])
 
-            y_sub = fem.Function(prob.V_sub)
-            y_sub.interpolate(Expression(y, prob.V_sub.element.interpolation_points))
+            self.y_sub = fem.Function(prob.V_sub)
+            self.y_sub.interpolate(Expression(y, prob.V_sub.element.interpolation_points))
             # Update y_func for gap evaluation in contact residual
-            prob.y_func.x.array[:] = y_sub.x.array[:]
+            prob.y_func.x.array[:] = self.y_sub.x.array[:]
             prob.y_func.x.scatter_forward()
 
             # ================================================================
@@ -711,15 +710,14 @@ class ContactSolver:
                 self.u_sub.interpolate_nonmatching(prob.u, cells=np.arange(prob.n_sub_cells),
                                                    interpolation_data=prob.interp_data)
             except Exception as e:
-                if self.comm.rank == 0:
-                    print(f"Warning: interpolate_nonmatching u_sub failed: {e}; using fallback zeros")
+                print(f"Warning: interpolate_nonmatching u_sub failed: {e}; using fallback zeros")
                 self.u_sub.x.array[:] = 0.0
                 self.u_sub.x.scatter_forward()
 
             # Build y on submesh (rigid plane at plane_loc)
             y = ufl.as_vector([self.xi, cfg.plane_loc * np.ones_like(self.xi)])
-            y_sub = Function(prob.V_sub)
-            y_sub.interpolate(Expression(y, prob.V_sub.element.interpolation_points))
+            self.y_sub = Function(prob.V_sub)
+            self.y_sub.interpolate(Expression(y, prob.V_sub.element.interpolation_points))
 
             # Project current normal to DG function on submesh    
             self.nx_sub = Function(prob.V_sub_n)
@@ -730,11 +728,11 @@ class ContactSolver:
                     interpolation_data=prob.interp_data_n)
             except Exception as e:
                 print(f"Warning: interpolate_nonmatching nx_sub failed: {e}")
-                break
+                break 
             
             # Compute gap on submesh at nodes (for multiplier update)
             gN_sub = Function(prob.V_sub_scalar) # same space as lN_sub
-            g_expr = gap_rt(self.nx_sub, self.X_sub + self.u_sub, y_sub)
+            g_expr = gap_rt(self.nx_sub, self.X_sub + self.u_sub, self.y_sub)
             try:
                 expr_g = Expression(g_expr, prob.V_sub_scalar.element.interpolation_points)
                 gN_sub.interpolate(expr_g)
@@ -744,7 +742,7 @@ class ContactSolver:
                 gN_sub.x.scatter_forward()  
  
             # Penetration on contact submesh: L2 norm and max penetration (at quadrature points)
-            pen_L2, pen_max = self._compute_penetration(d_val)
+            pen_L2, pen_max = self._compute_penetration()
 
             # Store lN_sub BEFORE the update (for computing the multiplier change)
             self.lN_sub_prev_func.x.array[:] = prob.lN_sub.x.array[:]
@@ -865,7 +863,7 @@ class ContactSolver:
                 R=cfg.R,
                 step_idx=step,
                 output_dir=os.path.join(cfg.output_dir, "ray_tracing"),
-                debug_plots=cfg.debug_plots if alt_iter == 0  else False,  # Only debug first iteration
+                debug_plots=cfg.debug_plots, 
                 debug_monitor=False,
                 u_field=self.u_sub,
             )
@@ -874,10 +872,10 @@ class ContactSolver:
             # Update positions of projected points on reference plane
             y = ufl.as_vector([self.xi, cfg.plane_loc * np.ones_like(self.xi)])
 
-            y_sub = fem.Function(prob.V_sub)
-            y_sub.interpolate(Expression(y, prob.V_sub.element.interpolation_points))
+            self.y_sub = fem.Function(prob.V_sub)
+            self.y_sub.interpolate(Expression(y, prob.V_sub.element.interpolation_points))
             # Update y_func for gap evaluation in contact residual
-            prob.y_func.x.array[:] = y_sub.x.array[:]
+            prob.y_func.x.array[:] = self.y_sub.x.array[:]
             prob.y_func.x.scatter_forward()
 
             # =================================================================================
@@ -947,81 +945,79 @@ class ContactSolver:
         print(f"  -> Final: rel_u={rel_change_u:.4e}, rel_ξ={rel_change_xi:.4e} (tol={alt_tol:.4e})")
         return ConvergenceStatus.MAX_ITERATIONS, total_newton_its, None
 
-    def _compute_penetration(self, d_val):
-        """Compute penetration metrics on the contact surface.
+    def _compute_penetration(self):
+        """Compute penetration metrics on contact boundary.
 
-        The gap is evaluated at quadrature points on the parent mesh,
+        The gap is evaluated at quadrature points on the contact submesh,
         consistent with the integral enforcement of the impenetrability
         constraint in the variational formulation.
 
         Returns
         -------
         pen_L2 : float
-            Integral norm L²(Γc) of penetration: √(∫ min(g,0)² ds).
+            Integral L²(Γc) norm of penetration: √(∫ min(g,0)² ds).
         pen_max : float
             Maximum pointwise penetration at quadrature points (mesh-independent).
         """
         prob = self.problem
         cfg = self.cfg
 
-        # ------------------------------------------------------------------
-        # 1. Build y_parent on the parent mesh (same pattern as postprocessing)
-        # ------------------------------------------------------------------
-        # y is already stored on the submesh (prob.y_func); interpolate it
-        # back to the parent DG vector space so the gap UFL lives on the
-        # parent mesh and can be integrated over ds_top.
-        sub_cells = np.arange(prob.num_sub_cells, dtype=np.int32)
-        parent_facets = prob.map_to_parent.sub_topology_to_topology(sub_cells, False)
-        tdim = prob.domain.topology.dim
-        fdim = tdim - 1
-        prob.domain.topology.create_connectivity(fdim, tdim)
-        facet_to_cell = prob.domain.topology.connectivity(fdim, tdim)
-        parent_cells = np.array([facet_to_cell.links(f)[0] for f in parent_facets],
-                                dtype=np.int32)
+        # Refresh submesh kinematics from the CURRENT converged state so
+        # penetration metrics are consistent across contact methods.
+        self.X_sub = ufl.SpatialCoordinate(prob.contact_mesh)
 
-        y_parent = Function(prob.V_parent)
-        y_parent.x.array[:] = 0.0
+        self.u_sub = Function(prob.V_sub)
         try:
-            interp_sub_to_parent = fem.create_interpolation_data(
-                prob.V_parent, prob.V_sub, cells=parent_cells)
-            y_parent.interpolate_nonmatching(prob.y_func, cells=parent_cells,
-                                             interpolation_data=interp_sub_to_parent)
-            y_parent.x.scatter_forward()
-        except Exception:
-            y_parent.x.array[:] = 0.0
-            y_parent.x.scatter_forward()
+            self.u_sub.interpolate_nonmatching(
+                prob.u,
+                cells=np.arange(prob.num_sub_cells),
+                interpolation_data=prob.interp_data,
+            )
+        except Exception as e:
+            print(f"Warning: interpolate_nonmatching u_sub failed in penetration check: {e}; using fallback zeros")
+            self.u_sub.x.array[:] = 0.0
+            self.u_sub.x.scatter_forward()
 
-        # ------------------------------------------------------------------
-        # 2. Gap as UFL on parent mesh, integrated over contact boundary
-        # ------------------------------------------------------------------
-        g_parent = gap_rt(prob.nx, prob.X + prob.u, y_parent)
-        ds_contact = prob.ds(prob.ft["contact"])
+        # Project current normal to DG function on submesh    
+        self.nx_sub = Function(prob.V_sub_n)
+        try:
+            nx_parent = prob.project_current_normal_to_function()
+            self.nx_sub.interpolate_nonmatching(
+                nx_parent, cells=np.arange(prob.num_sub_cells),
+                interpolation_data=prob.interp_data_n)
+        except Exception as e:
+            print(f"Warning: interpolate_nonmatching nx_sub failed: {e}; using fallback zeros")
+            self.nx_sub.x.array[:] = 0.0
+            self.nx_sub.x.scatter_forward()
+
+        self.y_sub = Function(prob.V_sub)
+        self.y_sub.x.array[:] = prob.y_func.x.array[:]
+        self.y_sub.x.scatter_forward()
+
+        g = gap_rt(self.nx_sub, self.X_sub + self.u_sub, self.y_sub)
+        dx_sub = ufl.Measure("dx", domain=prob.contact_mesh)
 
         # min(g, 0) = penetration (negative part of the gap)
-        pen_expr = ufl.min_value(g_parent, 0.0)
+        pen_expr = ufl.min_value(g, 0.0)
 
         # L2-norm of penetration: sqrt( ∫_Γc min(g,0)² ds )
         pen_L2_sq = self.comm.allreduce(
-            fem.assemble_scalar(fem.form(pen_expr**2 * ds_contact)), MPI.SUM)
+            fem.assemble_scalar(fem.form(pen_expr**2 * dx_sub)), MPI.SUM)
         pen_L2 = np.sqrt(pen_L2_sq)
 
-        # Max penetration for logging (evaluate at quadrature points)
-        pen_max = 0.0
-        try:
-            contact_facets = prob.facet_tags.find(prob.ft["contact"])
-            quad_deg = prob.metadata["quadrature_degree"]
-            _, g_quad, _ = expression_at_quadrature(
-                prob.domain, g_parent, quad_deg, contact_facets)
-            pen_vals = np.minimum(g_quad, 0.0)
-            pen_max_local = np.max(np.abs(pen_vals)) if len(pen_vals) > 0 else 0.0
-            pen_max = self.comm.allreduce(pen_max_local, MPI.MAX)
-        except Exception:
-            pass
-
+        # Max penetration (evaluated at quadrature points)
+        g_func = Function(prob.V_q) 
+        g_func.interpolate(Expression(g, prob.V_q.element.interpolation_points))
+        g_func.x.scatter_forward()  
+        dof_coords = prob.V_q.tabulate_dof_coordinates()
+        self.x_quad_g = dof_coords[:, 0]  # x-coordinates of quadrature points
+        self.gap_vals = g_func.x.array
+        pen_vals = self.gap_vals[self.gap_vals < 0.0]
+        pen_max = np.max(np.abs(pen_vals)) if pen_vals.size > 0 else 0.0
 
         if self.comm.rank == 0:
-            print(f"  Penetration check: L2-norm={pen_L2:.4e}, max|pen|={pen_max:.4e}")
-
+            print(f"Penetration check: L2-norm={pen_L2:.4e}, max |pen|={pen_max:.4e}")
+            
         return pen_L2, pen_max
 
     def _solve_snes_vi(self):
@@ -1147,7 +1143,6 @@ def run_simulation(cfg: SimulationConfig):
     if comm.rank == 0:
         print("=" * 60)
         print("Signorini Contact: Compressible Disk on Rigid Plane")
-        print("RAY-TRACING mapping for gap function")
         print("=" * 60)
         print(f"Material: {cfg.hyperelastic_model if not cfg.linear else 'Linear Elastic'}, Y={cfg.Y:.2e}, nu={cfg.nu}")
         print(f"Contact method: {cfg.contact_method}")
@@ -1251,60 +1246,15 @@ def run_simulation(cfg: SimulationConfig):
             gap_expr = g0 + ufl.dot(problem.Ny, problem.u)    
             x_quad_g, g_quad, _ = expression_at_quadrature(
                 problem.domain, gap_expr, quad_deg, contact_facets)
+        else:  
+            gap_error_L2, max_pen = solver._compute_penetration()   
+            x_quad_g, g_quad = solver.x_quad_g, solver.gap_vals
 
-        else:        
-            # Compute gap by first interpolating `y_func` (on submesh) to the
-            # parent mesh, so the gap expression lives on a single domain
-            # (the parent mesh). 
-            try:
-                # Map submesh cell indices -> parent facet indices
-                sub_cells = np.arange(problem.num_sub_cells, dtype=np.int32)
-                parent_facets = problem.map_to_parent.sub_topology_to_topology(sub_cells, False)
-                # Build facet->cell connectivity to get parent cells adjacent to facets
-                tdim = problem.domain.topology.dim
-                fdim = tdim - 1
-                problem.domain.topology.create_connectivity(fdim, tdim)
-                facet_to_cell = problem.domain.topology.connectivity(fdim, tdim)
-                parent_cells = np.array([facet_to_cell.links(f)[0] for f in parent_facets], dtype=np.int32)
-
-                # Interpolate y_func (submesh) to parent vector space
-                y_parent = Function(problem.V_parent)
-                y_parent.x.array[:] = 0.0   
-                try:
-                    # Create interpolation data for sub->parent mapping for these cells
-                    interp_sub_to_parent = fem.create_interpolation_data(
-                        problem.V_parent, problem.V_sub, cells=parent_cells)
-                    y_parent.interpolate_nonmatching(problem.y_func, cells=parent_cells,
-                                                        interpolation_data=interp_sub_to_parent)
-                    y_parent.x.scatter_forward()
-                except Exception:
-                    # Fallback: zero out y_parent   
-                        y_parent.x.array[:] = 0.0
-                        y_parent.x.scatter_forward()
-
-                # Now build gap on parent mesh and evaluate at quadrature points on contact boundary
-                g_parent = gap_rt(problem.nx, problem.X + problem.u, y_parent)
-                x_quad_g, g_quad, _ = expression_at_quadrature(
-                    problem.domain, g_parent, quad_deg, contact_facets)
-
-            except Exception as e:
-                print(f"Warning: gap evaluation at quadrature points failed: {e}; setting gap to zero")
-                # If there is an exception, produce a zero gap array
-                g_quad = np.zeros_like(p_quad)
-
-        # Nodal positions on contact submesh in current configuration
-        X_sub = ufl.SpatialCoordinate(problem.contact_mesh)
-        u_sub = Function(problem.V_sub)
-        try:
-            u_sub.interpolate_nonmatching(problem.u, cells=np.arange(problem.num_sub_cells),
-                                            interpolation_data=problem.interp_data)
-        except Exception as e:
-            print(f"Warning: interpolate_nonmatching for u_sub failed: {e}; using fallback zeros")
-            u_sub.x.array[:] = 0.0
-            u_sub.x.scatter_forward()
         
+        # Nodal positions on contact submesh in current configuration
         x_current = fem.Function(problem.V_sub)
-        x_current.interpolate(fem.Expression(X_sub + u_sub, problem.V_sub.element.interpolation_points))
+        x_current_expr = solver.X_sub + solver.u_sub
+        x_current.interpolate(fem.Expression(x_current_expr, problem.V_sub.element.interpolation_points))
         x_current.x.scatter_forward()
 
         # L2-error of contact pressure against Hertz solution 
@@ -1341,8 +1291,9 @@ def run_simulation(cfg: SimulationConfig):
             print("--- Monitoring ---")
             print(f"Elastic energy: {fem.assemble_scalar(fem.form(problem.psi * problem.dx)):.4e}")
             print(f"Normal contact force Fn: {Fn:.4e} N")
-            print(f"Contact pressure (quad points): min: {p_quad.min()}, max: {p_quad.max()}")
-            print(f"Gap function (quad points): min: {g_quad.min()}, max: {g_quad.max()}")
+            print(f"Contact pressure (quad points): min: {p_quad.min():.4e}, max: {p_quad.max():.4e}")
+            print(f"Gap function (quad points): min: {g_quad.min():.4e}, max: {g_quad.max():.4e}")
+
 
         # Store results
         results.step.append(step + 1)
@@ -1401,11 +1352,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--gamma0", type=float, default=None,
-        help="Nitsche stabilization parameter gamma=gamma0*Y/h (default: from config)"
+        help="Nitsche stabilization parameter gamma=gamma0*Y/h (default: 10.0)"
     )
     parser.add_argument(
         "--theta", type=int, default=None, choices=[-1, 0, 1],
-        help="Nitsche parameter for variant selection: 1=symmetric, -1=skew, 0=unsymmetric"
+        help="Nitsche parameter for variant selection: 1=symmetric, -1=skew, 0=unsymmetric (default: 0)"
     )
     parser.add_argument(
         "--lcmin", type=float, default=None,
@@ -1413,7 +1364,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--u-degree", type=int, default=None,
-        help="Displacement polynomial degree (default: from config)"
+        help="Displacement polynomial degree (default: 1)"
     )
     
     args = parser.parse_args()

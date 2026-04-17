@@ -41,10 +41,6 @@ python3 examples/run_signorini.py --help
 ## Notes on the current state of the codes
 The repository is still under development. The aim of publishing the codes is to make the implementations available, encourage reuse, and possibly receive suggestions for improvements.
 
-At the current stage, the repository includes only the Signorini benchmark problem.
-
-A second benchmark on deep indentation will be added once the corresponding code has been cleaned up.
-
 ## Contact
 If you find bugs, have suggestions, or would like to discuss the code, please open an issue in the repository.
 

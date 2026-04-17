@@ -11,9 +11,120 @@ from pathlib import Path
 
 def elastic_block_sym_DI(ind_center, Dmin, Dmax, ft, ct, h_min, Lx=1.0, Ly=1.0, refinement_ratio = 40, gdim=2, verbosity=1):
     """
-    Symmetric domain mesh for (deep) indentation contact.
+    Symmetric half-space -- mesh for (deep) indentation contact.
     
-    Domain: [-Lx/2, Lx/2] x [-Ly, 0]
+    Domain: [0, 0] x [Lx, -Ly]
+    Refinement around the indenter center point.
+    
+    Parameters
+    ----------
+    ind_center : tuple (x, y)
+        Indenter center position for mesh refinement
+    Dmin, Dmax : float
+        Distance thresholds for mesh refinement (min and max distance from center)
+    ft, ct : dict
+        Facet and cell tags
+    h_min : float
+        Minimum element size near indenter
+    Lx, Ly : float
+        Domain dimensions (width = Lx, height = Ly)
+    refinement_ratio : float
+        Ratio between max and min element sizes
+    gdim : int
+        Geometric dimension (default 2)
+    verbosity : int
+        GMSH verbosity level
+
+    Returns
+    -------
+    msh : dolfinx.mesh.Mesh
+        The generated mesh
+    cell_tags : dolfinx.mesh.MeshTags
+        Cell tags
+    facet_tags : dolfinx.mesh.MeshTags
+        Facet tags
+    """
+    gmsh.initialize()
+    gmsh.option.setNumber('General.Verbosity', verbosity)
+
+    mesh_comm = MPI.COMM_WORLD
+    model_rank = 0
+
+    facet_tags = ft
+    cell_tags = ct
+    
+    model = gmsh.model()
+    model.add('elastic_block')
+    model.set_current('elastic_block')
+
+    xc, yc = ind_center
+
+    # Points 
+    p1 = model.geo.addPoint(0,0,0)
+    p2 = model.geo.addPoint(0,-Ly,0)
+    p3 = model.geo.addPoint(Lx,-Ly,0)
+    p4 = model.geo.addPoint(Lx,0,0) 
+    pt1 = model.geo.addPoint(xc,yc,0)
+    
+    # Lines
+    l1 = model.geo.addLine(p1, p2, tag=facet_tags["left"])
+    l2 = model.geo.addLine(p2, p3, tag=facet_tags["bottom"])
+    l3 = model.geo.addLine(p3, p4, tag=facet_tags["right"])
+    l4 = model.geo.addLine(p4, p1, tag=facet_tags["top"])
+    # Surface
+    cloop1 = model.geo.addCurveLoop([l1, l2, l3, l4])
+    surf1 = 1 
+    surface_1 = model.geo.addPlaneSurface([cloop1], tag=surf1)
+    model.geo.synchronize()
+
+    # # Set Physical groups
+    # # Surface
+    model.addPhysicalGroup(2, [surf1], tag=cell_tags["all"])
+    for key, value in facet_tags.items():
+        model.addPhysicalGroup(1, [value], tag=value)
+        model.setPhysicalName(1, value, key)
+    
+    # Mesh refinement
+    model.mesh.field.add("Distance", 1)
+    model.mesh.field.setNumbers(1, "NodesList", [pt1])
+    model.mesh.field.add("Threshold", 2)
+    model.mesh.field.setNumber(2, "IField", 1)
+    model.mesh.field.setNumber(2, "LcMin", h_min)
+    model.mesh.field.setNumber(2, "LcMax", h_min * refinement_ratio)
+    model.mesh.field.setNumber(2, "DistMin", Dmin)
+    model.mesh.field.setNumber(2, "DistMax", Dmax)
+    model.mesh.field.setAsBackgroundMesh(2)
+
+    model.mesh.generate(gdim)
+    
+    # Mesh visualization
+    #gmsh.fltk.run()
+
+    # # Convert to DOLFINx mesh
+    if float(dolfinx.__version__[2:4]) >= 9.0:
+        meshdata = model_to_mesh(
+            model, mesh_comm, model_rank, gdim=gdim
+        )
+        msh = meshdata.mesh
+        cell_tags = meshdata.cell_tags
+        facet_tags = meshdata.facet_tags
+    else:
+        msh, cell_tags, facet_tags = model_to_mesh(
+            model, mesh_comm, model_rank, gdim=gdim
+        )
+        
+    msh.name = "indented_block"
+    cell_tags.name = f"{msh.name}_cells"
+    facet_tags.name = f"{msh.name}_facets"
+
+    gmsh.finalize()  
+    return msh, cell_tags, facet_tags
+
+def elastic_block_DI(ind_center, Dmin, Dmax, ft, ct, h_min, Lx=1.0, Ly=1.0, refinement_ratio = 40, gdim=2, verbosity=1):
+    """
+    Mesh for half-space in (deep) indentation contact.
+    
+    Domain: [-Lx/2, 0] x [Lx/2, -Ly]
     Refinement around the indenter center point.
     
     Parameters
