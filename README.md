@@ -39,7 +39,14 @@ python3 examples/run_signorini.py --help
 ```
 
 ## Notes on the current state of the codes
-The repository is still under development. The aim of publishing the codes is to make the implementations available, encourage reuse, and possibly receive suggestions for improvements.
+The repository is actively developed. The aim of publishing the codes is to make the implementations available, encourage reuse, and possibly receive suggestions for improvements.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for a full overview and a list of known
+limitations.
+
+## Contributing
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for
+information on the scope of the project, how to report bugs, and known limitations.
 
 ## Contact
 If you find bugs, have suggestions, or would like to discuss the code, please open an issue in the repository.
